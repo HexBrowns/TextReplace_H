@@ -1,0 +1,27 @@
+[package]
+name = "text-replace-h"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+authors = ["HexBrowns"]
+description = "TextReplace_H - テキストオブジェクトの本文を検索・置換し、指定した文字数で改行する AviUtl2 プラグイン"
+publish = false
+
+[lib]
+name = "text_replace_h"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aviutl2 = { version = "0.48", features = ["generic"] }
+aviutl2-eframe = "0.48"
+parking_lot = "0.12"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+unicode-normalization = "0.1"
+# メニューから、隠れているウィンドウを前に出す（MidpointTable_H と同じ）
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+lto = true

@@ -16,20 +16,15 @@ mod gui;
 pub mod text;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 
 use aviutl2::generic::GlobalEditHandle;
-use aviutl2::raw_window_handle::HasWindowHandle;
 use aviutl2::AnyResult;
 use parking_lot::{Mutex, RwLock};
 
 pub const WINDOW_NAME: &str = "テキスト置換";
 
 pub(crate) static EDIT_HANDLE: GlobalEditHandle = GlobalEditHandle::new();
-
-/// ウィンドウの HWND（メニューから前に出すため）
-static WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
 
 fn init_logging() {
     use aviutl2::tracing::Level;
@@ -39,21 +34,6 @@ fn init_logging() {
         .event_format(aviutl2::logger::AviUtl2Formatter)
         .with_writer(aviutl2::logger::AviUtl2LogWriter)
         .try_init();
-}
-
-/// ウィンドウを表示して前に出す（MidpointTable_H と同じ）
-fn open_window() {
-    let hwnd = WINDOW_HWND.load(Ordering::Acquire);
-    if hwnd == 0 {
-        return;
-    }
-    unsafe {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_SHOW};
-        let hwnd = HWND(hwnd as _);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
-    }
 }
 
 #[aviutl2::plugin(GenericPlugin)]
@@ -94,20 +74,12 @@ impl aviutl2::generic::GenericPlugin for TextReplacePlugin {
                 if let Err(e) = registry.register_window_client(WINDOW_NAME, &handle) {
                     tracing::error!("register_window_client 失敗: {e}");
                 }
-                if let Ok(raw) = handle.window_handle() {
-                    if let aviutl2::raw_window_handle::RawWindowHandle::Win32(h) = raw.as_raw() {
-                        WINDOW_HWND.store(h.hwnd.get(), Ordering::Release);
-                    }
-                }
             }
             Err(e) => tracing::error!("テキスト置換のウィンドウのハンドルを取れませんでした: {e:#}"),
         }
         *self.window.lock() = Some(window);
 
-        // タイムラインの右クリック（レイヤー・オブジェクト）と編集メニュー（ショートカットを割り当てられる）
-        registry.register_layer_menu("テキスト置換を開く", open_window);
-        registry.register_object_menu("テキスト置換を開く", open_window);
-        registry.register_edit_menu("テキスト置換を開く", open_window);
+        // ウィンドウは表示メニューから開く（メニューから ShowWindow しても開かない。2026-10-10 にユーザーの指摘で外した）
     }
 
     fn on_project_load(&mut self, project: &mut aviutl2::generic::ProjectFile) {

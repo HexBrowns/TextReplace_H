@@ -220,6 +220,8 @@ pub struct Report {
     pub written: usize,
     /// 検索した後に本体側で変わっていたので書かなかった
     pub stale: Vec<String>,
+    /// 「そろえる」で、中間点の数が違うので写さなかった相手（場所と項目）
+    pub points_mismatch: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -255,7 +257,11 @@ pub fn apply(writes: Vec<Write>) -> Result<Report, String> {
                         tracing::warn!("[TextReplace_H] {} / {}: wrote {:?} read back {:?}", w.place, t.label(), w.new_raw, back);
                         report.errors.push(format!("{}: 書いた値と読み返しが違います", w.place));
                     }
-                    Err(_) => report.written += 1,
+                    // 読み返せなければ、入ったかを確かめられていない（ルール au2-rs-plugin「書き込みは読み返して確かめる」）
+                    Err(e) => {
+                        tracing::warn!("[TextReplace_H] {} / {}: read back failed: {e}", w.place, t.label());
+                        report.errors.push(format!("{}: 書いた後に読み返せません（{e}）", w.place));
+                    }
                 }
             }
             report
@@ -263,16 +269,74 @@ pub fn apply(writes: Vec<Write>) -> Result<Report, String> {
         .map_err(|e| format!("書き込みを始められませんでした: {e}"))
 }
 
-/// 一覧の行をクリックしたときだけ、そのオブジェクトにフォーカスを移す
-pub fn focus(handle: ObjectHandle) -> Result<(), String> {
+/// 一覧の行から、フォーカスを移す先（検索したときに読んだもの）
+#[derive(Debug, Clone)]
+pub struct FocusTarget {
+    pub handle: ObjectHandle,
+    /// 検索したときのシーン
+    pub scene_id: i32,
+    pub target: Target,
+    /// 検索したときの保存形式
+    pub raw: String,
+    /// 検索したときのレイヤーと開始フレーム
+    pub layer: usize,
+    pub start: usize,
+}
+
+/// 検索したときと同じオブジェクトとみなせるか。項目が読めること（同じ種類のオブジェクト）に加えて、
+/// 本文か位置（レイヤーと開始フレーム）のどちらかが検索したときと同じこと。
+/// 検索の後に本文だけ直した・位置だけ動かしたものには移れるようにする
+pub fn same_object(now_raw: Option<&str>, now_place: Option<(usize, usize)>, raw: &str, place: (usize, usize)) -> bool {
+    match now_raw {
+        None => false,
+        Some(now) => now == raw || now_place == Some(place),
+    }
+}
+
+/// 一覧の行をクリックしたときだけ、そのオブジェクトにフォーカスを移す。
+/// ハンドルは検索の後に持ち越しているので、シーンと中身で同じオブジェクトかを確かめてから移す
+/// （ルール au2-plugin-checklist「オブジェクトのハンドル」。ハンドルの値が使い回されるかは実機未確認）
+pub fn focus(t: FocusTarget) -> Result<(), String> {
     ready()?;
     EDIT_HANDLE
-        .call_edit_section(move |edit| {
-            if edit.object_exists(handle) {
-                let _ = edit.set_focus_object(Some(handle));
+        .call_edit_section(move |edit| -> Result<(), String> {
+            if edit.info.scene_id != t.scene_id {
+                return Err("検索したときとシーンが違います。検索したシーンに戻すか、検索し直してください".into());
             }
+            if !edit.object_exists(t.handle) {
+                return Err("オブジェクトが見つかりません。検索し直してください".into());
+            }
+            let now_raw = edit.get_object_effect_item(t.handle, &t.target.effect, t.target.index, &t.target.item).ok();
+            let now_place = edit.get_object_layer_frame(t.handle).ok().map(|lf| (lf.layer, lf.start));
+            if !same_object(now_raw.as_deref(), now_place, &t.raw, (t.layer, t.start)) {
+                return Err("検索した後に本文も位置も変わっています。検索し直してください".into());
+            }
+            edit.set_focus_object(Some(t.handle)).map_err(|e| format!("フォーカスを移せませんでした: {e}"))
         })
-        .map_err(|e| format!("フォーカスを移せませんでした: {e}"))
+        .map_err(|e| format!("フォーカスを移せませんでした: {e}"))?
+}
+
+/// トラックバーの値の、移動方法の前に並ぶ数値の数と、移動方法と、設定の先頭（ビット）。
+/// 移動の無い値（数値 1 つ）やトラックバーでない値は None（BackupDiff_H の `live.rs` と同じ読み方）。
+/// 設定の中にカンマが入るので、末尾からは数えない（ルール au2-rs-plugin「設定項目の値の形式」）
+fn track_shape(value: &str) -> Option<(usize, &str, u32)> {
+    let fields: Vec<&str> = value.split(',').map(str::trim).collect();
+    let n = fields.iter().take_while(|f| f.parse::<f64>().is_ok()).count();
+    if n == 0 || n == fields.len() {
+        return None;
+    }
+    let bits = fields.get(n + 1).and_then(|s| s.split('|').next()).and_then(|b| b.parse::<u32>().ok()).unwrap_or(0);
+    Some((n, fields[n], bits))
+}
+
+/// 値の数値の数が、写し先の点（開始・中間点・終了）の数と合うか。移動の無い値はどこにでも写せる。
+/// 中間点無視（設定のビット 4）と再生範囲は値 2 つで保存されるので、2 つなら合うとみなす。
+/// 本体は数を検査せずに保存するので、合わない値を書くと動きが黙って変わる
+pub fn values_fit_points(value: &str, points: usize) -> bool {
+    match track_shape(value) {
+        None => true,
+        Some((n, motion, bits)) => n == points || (n == 2 && (bits & 4 != 0 || motion == "再生範囲")),
+    }
 }
 
 // ---- 見た目をそろえる（第 2 段階） ----
@@ -317,7 +381,8 @@ pub fn read_selected_texts() -> Result<Vec<ObjectHandle>, String> {
 }
 
 /// 「そろえる」ボタン専用。`targets` のテキスト効果の項目に `items` を書く（1 回の編集セクション = 本体の Undo 1 回分）。
-/// 書く直前に選択を読み直し、読んだときと違えば何も書かない
+/// 書く直前に選択を読み直し、読んだときと違えば何も書かない。
+/// 移動しているトラックバーの値は、写し先の点の数と合わなければ、その写し先には何も書かずに `points_mismatch` に入れる
 pub fn apply_style(targets: Vec<ObjectHandle>, items: Vec<(String, String)>) -> Result<Report, String> {
     ready()?;
     EDIT_HANDLE
@@ -329,7 +394,25 @@ pub fn apply_style(targets: Vec<ObjectHandle>, items: Vec<(String, String)>) -> 
             }
             let mut report = Report::default();
             for (n, h) in targets.iter().enumerate() {
-                let place = format!("{} 個目", n + 1);
+                let place = match edit.get_object_layer_frame(*h) {
+                    Ok(lf) => format!("L{} {}-{}", lf.layer + 1, lf.start, lf.end),
+                    Err(_) => format!("{} 個目", n + 1),
+                };
+                // 移動している値は、点の数が合う相手にだけ写す。合わなければこの相手には何も書かない
+                // （ルール au2-plugin-checklist「編集の前後で保つもの」。中間点の数は値の数で決まる）
+                let points = match edit.get_object_section_num(*h) {
+                    Ok(s) => s + 1,
+                    Err(e) => {
+                        report.errors.push(format!("{place}: 中間点の数を読めません（{e}）"));
+                        continue;
+                    }
+                };
+                let misfit: Vec<&str> = items.iter().filter(|(_, v)| !values_fit_points(v, points)).map(|(i, _)| i.as_str()).collect();
+                if !misfit.is_empty() {
+                    tracing::warn!("[TextReplace_H] style {place}: points {points}, skipped for {misfit:?}");
+                    report.points_mismatch.push(format!("{place}（{}）", misfit.join("・")));
+                    continue;
+                }
                 let mut ok = true;
                 for (item, value) in &items {
                     if let Err(e) = edit.set_object_effect_item(*h, TEXT_EFFECT, 0, item, value) {
@@ -344,7 +427,11 @@ pub fn apply_style(targets: Vec<ObjectHandle>, items: Vec<(String, String)>) -> 
                             report.errors.push(format!("{place} の {item}: 書いた値と読み返しが違います"));
                             ok = false;
                         }
-                        Err(_) => {}
+                        Err(e) => {
+                            tracing::warn!("[TextReplace_H] style {item}: read back failed: {e}");
+                            report.errors.push(format!("{place} の {item}: 書いた後に読み返せません（{e}）"));
+                            ok = false;
+                        }
                     }
                 }
                 if ok {
@@ -368,6 +455,39 @@ mod tests {
         assert_eq!((e[0].0.as_str(), e[0].1, e[0].2[0].1.as_str()), ("縁取り文字@X", 0, "あ"));
         assert_eq!((e[1].0.as_str(), e[1].1), ("縁取り文字@X", 1));
         assert_eq!((e[2].0.as_str(), e[2].1), ("標準描画", 0));
+    }
+
+    #[test]
+    fn values_and_points() {
+        // 移動の無い値・トラックバーでない値は、点の数によらず写せる
+        assert!(values_fit_points("34.00", 4));
+        assert!(values_fit_points("ffffff", 3));
+        assert!(values_fit_points("000000", 3));
+        assert!(values_fit_points("MS UI Gothic", 3));
+        // 移動している値は点の数が同じときだけ
+        assert!(values_fit_points("10.00,20.00,30.00,直線移動,0", 3));
+        assert!(!values_fit_points("10.00,20.00,30.00,直線移動,0", 2));
+        assert!(!values_fit_points("10.00,20.00,直線移動,0", 3));
+        // 中間点無視と再生範囲は値 2 つ
+        assert!(values_fit_points("10.00,20.00,直線移動,4", 5));
+        assert!(values_fit_points("10.00,20.00,直線移動,6|", 5));
+        assert!(values_fit_points("10.00,20.00,再生範囲,0", 3));
+        // 設定の中のカンマ
+        assert!(values_fit_points("0.00,100.00,プローブ移動_H,0|9,0,1", 2));
+        assert!(!values_fit_points("0.00,100.00,プローブ移動_H,0|9,0,1", 3));
+    }
+
+    #[test]
+    fn focus_same_object() {
+        let place = (2, 30);
+        // 本文も位置も同じ・本文だけ直した・位置だけ動かした、は同じオブジェクトとみなす
+        assert!(same_object(Some("あ"), Some((2, 30)), "あ", place));
+        assert!(same_object(Some("い"), Some((2, 30)), "あ", place));
+        assert!(same_object(Some("あ"), Some((5, 90)), "あ", place));
+        // 両方違う・項目が読めない（同じ種類のオブジェクトでない）は移らない
+        assert!(!same_object(Some("い"), Some((5, 90)), "あ", place));
+        assert!(!same_object(Some("い"), None, "あ", place));
+        assert!(!same_object(None, Some((2, 30)), "あ", place));
     }
 
     #[test]

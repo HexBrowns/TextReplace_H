@@ -7,7 +7,7 @@
 [project]
 id = "HexBrowns.TextReplace_H"
 name = "TextReplace_H"
-version = "0.2.1"
+version = "0.2.2"
 
 [artifacts."TextReplace_H.aux2"]
 build = "cargo build --release"

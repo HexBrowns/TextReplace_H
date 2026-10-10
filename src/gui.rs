@@ -13,7 +13,7 @@ use parking_lot::RwLock;
 
 use crate::aup2;
 use crate::dict::{self, Entry};
-use crate::edit_ops::{self, ItemKind, Target, Write};
+use crate::edit_ops::{self, FocusTarget, ItemKind, Target, Write};
 use crate::text::{self, Options, WrapOptions};
 
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(235, 200, 90);
@@ -84,6 +84,8 @@ pub struct TextReplaceApp {
     project: Arc<RwLock<Option<PathBuf>>>,
     q: Query,
     searched: Option<Query>,
+    /// 検索したときに表示していたシーン（一覧の書き換えられる行はこのシーンのもの）
+    searched_scene: Option<i32>,
     rows: Vec<Row>,
     notes: Vec<String>,
     status: String,
@@ -124,6 +126,7 @@ impl TextReplaceApp {
                 dict: Vec::new(),
             },
             searched: None,
+            searched_scene: None,
             rows: Vec::new(),
             notes: Vec::new(),
             status: String::new(),
@@ -278,6 +281,7 @@ impl TextReplaceApp {
         self.rows = rows;
         self.notes = notes;
         self.searched = Some(q);
+        self.searched_scene = Some(scene.id);
     }
 
     fn apply(&mut self) {
@@ -446,7 +450,8 @@ impl TextReplaceApp {
             ui.weak(if self.searched.is_some() { "当たるテキストはありません" } else { "条件を入れて「検索」を押してください" });
             return;
         }
-        let mut focus: Option<ObjectHandle> = None;
+        let mut focus: Option<FocusTarget> = None;
+        let scene_id = self.searched_scene;
         let mut last_scene: Option<(String, bool)> = None;
         for r in &mut self.rows {
             let key = (r.scene.clone(), r.handle.is_some());
@@ -464,9 +469,16 @@ impl TextReplaceApp {
                 }
                 let place = format!("L{} {}-{}", r.layer + 1, r.start, r.end);
                 let resp = ui.add(egui::Label::new(egui::RichText::new(place).monospace()).sense(egui::Sense::click()));
-                if let Some(h) = r.handle {
+                if let (Some(h), Some(scene_id)) = (r.handle, scene_id) {
                     if resp.on_hover_text("クリックでこのオブジェクトにフォーカスを移す").clicked() {
-                        focus = Some(h);
+                        focus = Some(FocusTarget {
+                            handle: h,
+                            scene_id,
+                            target: r.target.clone(),
+                            raw: r.raw.clone(),
+                            layer: r.layer,
+                            start: r.start,
+                        });
                     }
                 }
                 let label = r.target.label();
@@ -486,8 +498,8 @@ impl TextReplaceApp {
             });
         }
         // フォーカスはクリックしたときだけ移す（ルール au2-rs-plugin）
-        if let Some(h) = focus {
-            if let Err(e) = edit_ops::focus(h) {
+        if let Some(t) = focus {
+            if let Err(e) = edit_ops::focus(t) {
                 self.set_status(e, true);
             }
         }
@@ -542,12 +554,23 @@ impl TextReplaceApp {
         let (n, k) = (targets.len(), items.len());
         match edit_ops::apply_style(targets, items) {
             Ok(rep) => {
-                tracing::info!("[TextReplace_H] そろえる: {} / {n} 個（{k} 項目、失敗 {}）", rep.written, rep.errors.len());
+                tracing::info!(
+                    "[TextReplace_H] そろえる: {} / {n} 個（{k} 項目、中間点の数が違う {}、失敗 {}）",
+                    rep.written,
+                    rep.points_mismatch.len(),
+                    rep.errors.len()
+                );
                 let mut msg = format!("{} / {n} 個の {k} 項目をそろえました（Ctrl+Z で取り消せます）", rep.written);
+                if !rep.points_mismatch.is_empty() {
+                    msg.push_str(&format!(
+                        "。中間点の数が違うので写さなかった（移動している項目）: {}",
+                        rep.points_mismatch.join("、")
+                    ));
+                }
                 if !rep.errors.is_empty() {
                     msg.push_str(&format!("。失敗: {}", rep.errors.join("、")));
                 }
-                let error = !rep.errors.is_empty();
+                let error = !rep.points_mismatch.is_empty() || !rep.errors.is_empty();
                 self.set_status(msg, error);
             }
             Err(e) => {

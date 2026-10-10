@@ -13,6 +13,7 @@ mod aup2;
 mod dict;
 mod edit_ops;
 mod gui;
+mod input;
 pub mod text;
 
 use std::path::PathBuf;

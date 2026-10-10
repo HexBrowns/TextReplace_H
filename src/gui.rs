@@ -14,6 +14,7 @@ use parking_lot::RwLock;
 use crate::aup2;
 use crate::dict::{self, Entry};
 use crate::edit_ops::{self, FocusTarget, ItemKind, Target, Write};
+use crate::input::{self, LineEnd};
 use crate::text::{self, Options, WrapOptions};
 
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(235, 200, 90);
@@ -68,6 +69,39 @@ impl Row {
         let label = if label.is_empty() { String::new() } else { format!(" {label}") };
         format!("{} L{} {}-{}{label}", self.scene, self.layer + 1, self.start, self.end)
     }
+}
+
+/// 数値欄（ルール au2-rs-plugin「入力の確定と取り消し」）。`configure` で範囲・速さを付けた `DragValue` に
+/// `update_while_editing(false)` を足して置く。打っている途中の値は使わず、Enter かほかをクリックで確定する。
+///
+/// egui 0.36.2 の `DragValue` は `update_while_editing(false)` でも、Esc の次のフレームで打った文字を値にしてしまう
+/// （フォーカスを失ったとみなす期間が 2 フレームあり、2 フレーム目には Esc が押されていないため）。
+/// Esc のフレームの値を覚えておき、次のフレームで戻す（参照実装 LayerSilenceCut_H の `setting_value`）。
+/// 戻したフレームは、欄を描く前と値が同じなら `changed()` を偽にする
+fn drag_value<T>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    configure: impl for<'v> FnOnce(egui::DragValue<'v>) -> egui::DragValue<'v>,
+) -> egui::Response
+where
+    T: egui::emath::Numeric + Default + Send + Sync,
+{
+    let before = *value;
+    let mut resp = ui.add(configure(egui::DragValue::new(&mut *value)).update_while_editing(false));
+    let key = resp.id.with("escaped");
+    let pass = ui.ctx().cumulative_pass_nr();
+    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|d| d.insert_temp(key, (pass, *value)));
+    } else if let Some((at, kept)) = ui.data_mut(|d| d.remove_temp::<(u64, T)>(key)) {
+        if pass == at + 1 {
+            *value = kept;
+            if *value == before {
+                // `flags` は egui の doc(hidden) の公開フィールド。`changed()` を外す手段がこれしかない（0.36.2）
+                resp.flags.remove(egui::response::Flags::CHANGED);
+            }
+        }
+    }
+    resp
 }
 
 /// 見た目をそろえる画面の状態
@@ -340,8 +374,12 @@ impl TextReplaceApp {
                 ui.end_row();
                 for (i, e) in self.dict.iter_mut().enumerate() {
                     changed |= ui.checkbox(&mut e.enabled, "").changed();
-                    changed |= ui.add(egui::TextEdit::singleline(&mut e.find).desired_width(130.0)).changed();
-                    changed |= ui.add(egui::TextEdit::singleline(&mut e.replacement).desired_width(130.0)).changed();
+                    // 保存するのは Enter かフォーカスが外れたときだけ（打つたびにファイルへ書かない）。
+                    // 入力中の Esc で入力前の文字に戻す（保存してあるのは入力前のままなので書かない）
+                    let r = ui.add(egui::TextEdit::singleline(&mut e.find).desired_width(130.0));
+                    changed |= matches!(input::track(ui, &r, &mut e.find), LineEnd::Committed { changed: true, .. });
+                    let r = ui.add(egui::TextEdit::singleline(&mut e.replacement).desired_width(130.0));
+                    changed |= matches!(input::track(ui, &r, &mut e.replacement), LineEnd::Committed { changed: true, .. });
                     ui.horizontal(|ui| {
                         if ui.add_enabled(i > 0, egui::Button::new("↑").small()).on_hover_text("上へ（上から順に流します）").clicked() {
                             swap = Some((i - 1, i));
@@ -387,15 +425,20 @@ impl TextReplaceApp {
         if self.q.mode == Mode::Style {
             return;
         }
+        // 検索語・置換語・絞り込みは、Enter で検索する（検索は読み取りだけ。書き込みは下のボタン）。
+        // 入力中の Esc で入力前の文字に戻す
+        let mut enter = false;
         match self.q.mode {
             Mode::Replace => {
                 egui::Grid::new("query").num_columns(2).show(ui, |ui| {
                     ui.label("検索");
-                    ui.add(egui::TextEdit::singleline(&mut self.q.find).desired_width(260.0));
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.q.find).desired_width(260.0));
+                    enter |= input::track(ui, &r, &mut self.q.find).enter();
                     ui.end_row();
                     ui.label("置換");
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.q.replacement).desired_width(260.0));
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.q.replacement).desired_width(260.0));
+                        enter |= input::track(ui, &r, &mut self.q.replacement).enter();
                         if ui.add_enabled(!self.q.find.is_empty(), egui::Button::new("辞書に足す")).clicked() {
                             self.dict.push(Entry { find: self.q.find.clone(), replacement: self.q.replacement.clone(), enabled: true });
                             self.save_dict();
@@ -409,10 +452,11 @@ impl TextReplaceApp {
             Mode::Wrap => {
                 egui::Grid::new("query").num_columns(2).show(ui, |ui| {
                     ui.label("絞り込み");
-                    ui.add(egui::TextEdit::singleline(&mut self.q.find).desired_width(260.0).hint_text("空ならすべてのテキスト"));
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.q.find).desired_width(260.0).hint_text("空ならすべてのテキスト"));
+                    enter |= input::track(ui, &r, &mut self.q.find).enter();
                     ui.end_row();
                     ui.label("1 行の文字数");
-                    ui.add(egui::DragValue::new(&mut self.q.wrap.width).range(1.0..=500.0).speed(0.5));
+                    drag_value(ui, &mut self.q.wrap.width, |d| d.range(1.0..=500.0).speed(0.5));
                     ui.end_row();
                 });
             }
@@ -436,7 +480,7 @@ impl TextReplaceApp {
         }
         ui.horizontal(|ui| {
             let label = if self.q.mode == Mode::Dictionary { "辞書で検索" } else { "検索" };
-            if ui.button(label).clicked() {
+            if ui.button(label).clicked() || enter {
                 self.search();
             }
             for n in &self.notes {
@@ -648,5 +692,84 @@ impl eframe::App for TextReplaceApp {
             }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.render_rows(ui));
         });
+    }
+}
+
+#[cfg(test)]
+mod drag_value_tests {
+    //! 数値欄を egui だけで動かし、打っている途中の値が使われないこと・Esc で戻ること・Enter で確定することを確かめる
+
+    use super::*;
+
+    /// 画面なしで 1 フレーム回す。出力の textures_delta を空にしてから捨てる
+    /// （そのまま捨てると、デバッグビルドで epaint の debug_assert「Dropped TexturesDelta with N unapplied deltas」に落ちる）
+    fn run_frame(ctx: &egui::Context, input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) {
+        let mut out = ctx.run_ui(input, f);
+        out.textures_delta.clear();
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// 1 フレーム描き、`changed()` を返す。`focus` なら描く前に欄へフォーカスを移す（クリックと同じく全選択で編集に入る）
+    fn frame<T>(ctx: &egui::Context, value: &mut T, range: (T, T), events: Vec<egui::Event>, focus: bool) -> bool
+    where
+        T: egui::emath::Numeric + Default + Send + Sync,
+    {
+        let id_key = egui::Id::new("drag_value_test_id");
+        let mut changed = false;
+        let input = egui::RawInput { events, ..Default::default() };
+        run_frame(ctx, input, |ui| {
+            if focus {
+                if let Some(id) = ui.data(|d| d.get_temp::<egui::Id>(id_key)) {
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
+            }
+            let resp = drag_value(ui, value, |d| d.range(range.0..=range.1));
+            ui.data_mut(|d| d.insert_temp(id_key, resp.id));
+            changed = resp.changed();
+        });
+        changed
+    }
+
+    /// 打つ（まだ確定しない）
+    fn type_in<T>(ctx: &egui::Context, value: &mut T, range: (T, T), typed: &str)
+    where
+        T: egui::emath::Numeric + Default + Send + Sync,
+    {
+        frame(ctx, value, range, vec![], false);
+        frame(ctx, value, range, vec![], true);
+        frame(ctx, value, range, vec![egui::Event::Text(typed.into())], false);
+    }
+
+    /// 打つ → Esc → その後 3 フレーム、値は入力前のまま（`changed()` も偽）。Enter で確定した値は残る
+    fn check<T>(start: T, range: (T, T), typed: &str, expected: T)
+    where
+        T: egui::emath::Numeric + Default + Send + Sync + std::fmt::Debug,
+    {
+        let ctx = egui::Context::default();
+        let mut v = start;
+        type_in(&ctx, &mut v, range, typed);
+        assert_eq!(v, start, "打っている途中の値を使っている");
+        assert!(!frame(&ctx, &mut v, range, vec![key(egui::Key::Escape)], false));
+        for _ in 0..3 {
+            let changed = frame(&ctx, &mut v, range, vec![], false);
+            assert_eq!(v, start, "Esc の後のフレームでも入力前の値のまま");
+            assert!(!changed, "戻したフレームを「変わった」にしない");
+        }
+
+        type_in(&ctx, &mut v, range, typed);
+        assert!(frame(&ctx, &mut v, range, vec![key(egui::Key::Enter)], false));
+        for _ in 0..3 {
+            frame(&ctx, &mut v, range, vec![], false);
+        }
+        assert_eq!(v, expected, "Enter で確定した値は残る");
+    }
+
+    /// 1 行の文字数（f64）
+    #[test]
+    fn wrap_width_escape_discards_and_enter_commits() {
+        check::<f64>(16.0, (1.0, 500.0), "24.5", 24.5);
     }
 }
